@@ -1,5 +1,6 @@
 # 目前需要修改的
 /HighConcurrencyMemoryPool
+/修改说明.md
 
 .DS_Store
 Thumbs.db

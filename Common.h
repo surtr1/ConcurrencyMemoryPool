@@ -5,6 +5,9 @@
 #include <unordered_map>
 #include <map>
 #include <algorithm>
+#include <cstring>
+#include <new>
+#include <cstdint>
 
 #include <time.h>
 #include <assert.h>
@@ -17,31 +20,49 @@ using std::cout;
 using std::endl;
 
 #ifdef _WIN32
-	#include <windows.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #else
-	// ...
+// 如果后续要支持 Linux，可以在这里补 mmap / munmap 等系统接口。
 #endif
 
+#if defined(_MSC_VER)
+#define MP_FORCEINLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define MP_FORCEINLINE inline __attribute__((always_inline))
+#else
+#define MP_FORCEINLINE inline
+#endif
+
+// 整个内存池的关键参数：
+// 1. MAX_BYTES：超过这个大小的请求不走小对象分配逻辑，直接按页处理；
+// 2. NFREELIST：小对象按 size class 划分后，总共有多少个自由链表桶；
+// 3. NPAGES：PageCache 一次最多管理 1~128 页的 span，因此数组长度开到 129；
+// 4. PAGE_SHIFT=13：表示一页大小是 2^13 = 8192 字节，也就是 8KB。
 static const size_t MAX_BYTES = 256 * 1024;
 static const size_t NFREELIST = 208;
 static const size_t NPAGES = 129;
 static const size_t PAGE_SHIFT = 13;
 
 #ifdef _WIN64
-	typedef unsigned long long PAGE_ID;
+typedef unsigned long long PAGE_ID;
 #elif _WIN32
-	typedef size_t PAGE_ID;
+typedef size_t PAGE_ID;
 #else
-	// linux
+// Linux 版本可以在这里补页号类型定义。
 #endif
 
-// 直接去堆上按页申请空间
+// 直接向操作系统申请 k 个页的连续空间。
+// 注意：这里的“页”是当前内存池内部约定的 8KB 页，不是 Windows 默认的 4KB 物理页。
+// SystemAlloc 只负责“要来一大块连续地址空间”，后续如何切成小对象由上层决定。
 inline static void* SystemAlloc(size_t kpage)
 {
 #ifdef _WIN32
-	void* ptr = VirtualAlloc(0, kpage << 13, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	void* ptr = VirtualAlloc(0, kpage << PAGE_SHIFT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-	// linux下brk mmap等
+	// Linux 版本可以在这里补 mmap/sbrk 路径。
 #endif
 
 	if (ptr == nullptr)
@@ -50,61 +71,50 @@ inline static void* SystemAlloc(size_t kpage)
 	return ptr;
 }
 
-
+// 将 SystemAlloc 申请到的整块页空间归还给操作系统。
 inline static void SystemFree(void* ptr)
 {
 #ifdef _WIN32
 	VirtualFree(ptr, 0, MEM_RELEASE);
 #else
-	// sbrk unmmap等
+	// Linux 版本可以在这里补 munmap 路径。
 #endif
 }
 
-static void*& NextObj(void* obj)
+// 小对象空闲时不会额外分配链表节点。
+// 而是直接复用对象起始处的几个字节，存“下一个空闲对象”的指针。
+// 这也是很多高性能内存池常见的做法。
+MP_FORCEINLINE void*& NextObj(void* obj)
 {
 	return *(void**)obj;
 }
 
-
-// 管理切分好的小对象的自由链表
+// FreeList 是 ThreadCache 里最核心的局部结构：
+// 每个 size class 对应一个 FreeList，里面串的是“当前线程可立即复用的小对象”。
 class FreeList
 {
 public:
-	void Push(void* obj)
+	// 头插一个空闲对象。
+	MP_FORCEINLINE void Push(void* obj)
 	{
 		assert(obj);
 
-		// 头插
-		//*(void**)obj = _freeList;
 		NextObj(obj) = _freeList;
 		_freeList = obj;
-
 		++_size;
 	}
 
-	void PushRange(void* start, void* end, size_t n)
+	// 批量头插一段对象。
+	// start/end 已经是一条串好的单链表，这里只需要接到当前自由链表前面。
+	MP_FORCEINLINE void PushRange(void* start, void* end, size_t n)
 	{
 		NextObj(end) = _freeList;
 		_freeList = start;
-
-		// 测试验证+条件断点
-		/*int i = 0;
-		void* cur = start;
-		while (cur)
-		{
-			cur = NextObj(cur);
-			++i;
-		}
-
-		if (n != i)
-		{
-			int x = 0;
-		}*/
-
 		_size += n;
 	}
 
-	void PopRange(void*& start, void*& end, size_t n)
+	// 从头部批量摘下 n 个对象，返回 [start, end]。
+	MP_FORCEINLINE void PopRange(void*& start, void*& end, size_t n)
 	{
 		assert(n <= _size);
 		start = _freeList;
@@ -120,11 +130,11 @@ public:
 		_size -= n;
 	}
 
-	void* Pop()
+	// 弹出一个对象，作为小对象分配的最快路径。
+	MP_FORCEINLINE void* Pop()
 	{
 		assert(_freeList);
 
-		// 头删
 		void* obj = _freeList;
 		_freeList = NextObj(obj);
 		--_size;
@@ -132,17 +142,26 @@ public:
 		return obj;
 	}
 
-	bool Empty()
+	MP_FORCEINLINE bool Empty()
 	{
 		return _freeList == nullptr;
 	}
 
-	size_t& MaxSize()
+	// 慢启动策略下，当前这条链表一次最多从 CentralCache 取多少对象。
+	// 它控制“单次 refill 批量大小”。
+	MP_FORCEINLINE size_t& MaxSize()
 	{
 		return _maxSize;
 	}
 
-	size_t Size()
+	// 当前线程愿意在本地保留的对象上限。
+	// 它控制“ThreadCache 最多囤多少对象”，避免缓存过多。
+	MP_FORCEINLINE size_t& MaxCacheSize()
+	{
+		return _maxCacheSize;
+	}
+
+	MP_FORCEINLINE size_t Size() const
 	{
 		return _size;
 	}
@@ -150,40 +169,24 @@ public:
 private:
 	void* _freeList = nullptr;
 	size_t _maxSize = 1;
+	size_t _maxCacheSize = 1;
 	size_t _size = 0;
 };
 
-// 计算对象大小的对齐映射规则
+// SizeClass 负责把“用户申请大小”转成“内存池内部规则”：
+// 1. 先决定按什么粒度对齐；
+// 2. 再决定落在哪个桶；
+// 3. 再决定一次批量搬运多少对象、需要多少页。
 class SizeClass
 {
 public:
-	// 整体控制在最多10%左右的内碎片浪费
-	// [1,128]					8byte对齐	    freelist[0,16)
-	// [128+1,1024]				16byte对齐	    freelist[16,72)
-	// [1024+1,8*1024]			128byte对齐	    freelist[72,128)
-	// [8*1024+1,64*1024]		1024byte对齐     freelist[128,184)
-	// [64*1024+1,256*1024]		8*1024byte对齐   freelist[184,208)
-
-	/*size_t _RoundUp(size_t size, size_t alignNum)
-	{
-		size_t alignSize;
-		if (size % alignNum != 0)
-		{
-			alignSize = (size / alignNum + 1)*alignNum;
-		}
-		else
-		{
-			alignSize = size;
-		}
-
-		return alignSize;
-	}*/
-	// 1-8 
 	static inline size_t _RoundUp(size_t bytes, size_t alignNum)
 	{
 		return ((bytes + alignNum - 1) & ~(alignNum - 1));
 	}
 
+	// 不同大小区间使用不同的对齐粒度，兼顾空间利用率和桶数量。
+	// 小对象对齐更细，减少内部碎片；大对象对齐更粗，减少桶数量。
 	static inline size_t RoundUp(size_t size)
 	{
 		if (size <= 128)
@@ -194,88 +197,65 @@ public:
 		{
 			return _RoundUp(size, 16);
 		}
-		else if (size <= 8*1024)
+		else if (size <= 8 * 1024)
 		{
 			return _RoundUp(size, 128);
 		}
-		else if (size <= 64*1024)
+		else if (size <= 64 * 1024)
 		{
 			return _RoundUp(size, 1024);
 		}
 		else if (size <= 256 * 1024)
 		{
-			return _RoundUp(size, 8*1024);
+			return _RoundUp(size, 8 * 1024);
 		}
 		else
 		{
-			return _RoundUp(size, 1<<PAGE_SHIFT);
+			return _RoundUp(size, 1 << PAGE_SHIFT);
 		}
 	}
 
-	/*size_t _Index(size_t bytes, size_t alignNum)
-	{
-	if (bytes % alignNum == 0)
-	{
-	return bytes / alignNum - 1;
-	}
-	else
-	{
-	return bytes / alignNum;
-	}
-	}*/
-
-	// 1 + 7  8
-	// 2      9
-	// ...
-	// 8      15
-	
-	// 9 + 7 16
-	// 10
-	// ...
-	// 16    23
 	static inline size_t _Index(size_t bytes, size_t align_shift)
 	{
-		return ((bytes + (1 << align_shift) - 1) >> align_shift) - 1;
+		return ((bytes + (((size_t)1 << align_shift) - 1)) >> align_shift) - 1;
 	}
 
-	// 计算映射的哪一个自由链表桶
+	// 把“对齐后的大小”映射到桶下标。
+	// 这里的分组和 RoundUp 一一对应，所以同一类大小一定会落到固定桶里。
 	static inline size_t Index(size_t bytes)
 	{
 		assert(bytes <= MAX_BYTES);
 
-		// 每个区间有多少个链
 		static int group_array[4] = { 16, 56, 56, 56 };
-		if (bytes <= 128){
+		if (bytes <= 128) {
 			return _Index(bytes, 3);
 		}
-		else if (bytes <= 1024){
+		else if (bytes <= 1024) {
 			return _Index(bytes - 128, 4) + group_array[0];
 		}
-		else if (bytes <= 8 * 1024){
+		else if (bytes <= 8 * 1024) {
 			return _Index(bytes - 1024, 7) + group_array[1] + group_array[0];
 		}
-		else if (bytes <= 64 * 1024){
+		else if (bytes <= 64 * 1024) {
 			return _Index(bytes - 8 * 1024, 10) + group_array[2] + group_array[1] + group_array[0];
 		}
-		else if (bytes <= 256 * 1024){
+		else if (bytes <= 256 * 1024) {
 			return _Index(bytes - 64 * 1024, 13) + group_array[3] + group_array[2] + group_array[1] + group_array[0];
 		}
-		else{
+		else {
 			assert(false);
 		}
 
 		return -1;
 	}
 
-	// 一次thread cache从中心缓存获取多少个
+	// 决定 ThreadCache 和 CentralCache 一次搬运多少对象。
+	// 对象越小，一次搬运得越多；对象越大，一次搬运得越少。
 	static size_t NumMoveSize(size_t size)
 	{
 		assert(size > 0);
 
-		// [2, 512]，一次批量移动多少个对象的(慢启动)上限值
-		// 小对象一次批量上限高
-		// 小对象一次批量上限低
-		int num = MAX_BYTES / size;
+		size_t num = MAX_BYTES / size;
 		if (num < 2)
 			num = 2;
 
@@ -285,16 +265,25 @@ public:
 		return num;
 	}
 
-	// 计算一次向系统获取几个页
-	// 单个对象 8byte
-	// ...
-	// 单个对象 256KB
+	// 决定某个 size class 在单线程本地最多缓存多少对象。
+	// 这里让上限和批量搬运值相关，但又设置了兜底下限和上限。
+	static size_t ThreadCacheMaxSize(size_t size)
+	{
+		size_t maxCacheSize = NumMoveSize(size) * 2;
+		if (maxCacheSize < 2)
+			maxCacheSize = 2;
+
+		if (maxCacheSize > 1024)
+			maxCacheSize = 1024;
+
+		return maxCacheSize;
+	}
+
+	// 根据一次批量搬运对象的总字节数，换算出需要向 PageCache 申请多少页。
 	static size_t NumMovePage(size_t size)
 	{
 		size_t num = NumMoveSize(size);
-		size_t npage = num*size;
-
-		npage >>= PAGE_SHIFT;
+		size_t npage = (num * size + ((size_t)1 << PAGE_SHIFT) - 1) >> PAGE_SHIFT;
 		if (npage == 0)
 			npage = 1;
 
@@ -302,23 +291,28 @@ public:
 	}
 };
 
-// 管理多个连续页大块内存跨度结构
+// Span 表示一段连续页，是 PageCache / CentralCache 的核心管理单位。
+// 当它被切成小对象后，还会额外记录：
+// 1. 小对象大小；
+// 2. 当前有多少对象被分配出去了；
+// 3. 这一段页里剩余可分配对象组成的自由链表。
 struct Span
 {
-	PAGE_ID _pageId = 0; // 大块内存起始页的页号
-	size_t  _n = 0;      // 页的数量
+	PAGE_ID _pageId = 0;   // 这段连续页的起始页号。
+	size_t  _n = 0;        // 一共跨了多少页。
 
-	Span* _next = nullptr;	// 双向链表的结构
+	Span* _next = nullptr;
 	Span* _prev = nullptr;
 
-	size_t _objSize = 0;  // 切好的小对象的大小
-	size_t _useCount = 0; // 切好小块内存，被分配给thread cache的计数
-	void* _freeList = nullptr;  // 切好的小块内存的自由链表
+	size_t _objSize = 0;   // 如果已经切成小对象，这里记录每个对象的大小。
+	size_t _useCount = 0;  // 当前有多少个小对象已经被 ThreadCache 借走。
+	void* _freeList = nullptr; // 当前 span 中还空闲的小对象链表。
 
-	bool _isUse = false;          // 是否在被使用
+	bool _isUse = false;   // 这段 span 是否正处于“被使用 / 被切分”状态。
 };
 
-// 带头双向循环链表 
+// SpanList 是带头双向循环链表。
+// CentralCache 和 PageCache 都会用它来管理同类 span。
 class SpanList
 {
 public:
@@ -349,6 +343,11 @@ public:
 		Insert(Begin(), span);
 	}
 
+	void PushBack(Span* span)
+	{
+		Insert(End(), span);
+	}
+
 	Span* PopFront()
 	{
 		Span* front = _head->_next;
@@ -356,30 +355,24 @@ public:
 		return front;
 	}
 
+	// 在 pos 前插入一个新 span。
 	void Insert(Span* pos, Span* newSpan)
 	{
 		assert(pos);
 		assert(newSpan);
 
 		Span* prev = pos->_prev;
-		// prev newspan pos
 		prev->_next = newSpan;
 		newSpan->_prev = prev;
 		newSpan->_next = pos;
 		pos->_prev = newSpan;
 	}
 
+	// 从链表中摘掉一个 span。
 	void Erase(Span* pos)
 	{
 		assert(pos);
 		assert(pos != _head);
-
-		// 1、条件断点
-		// 2、查看栈帧
-		/*if (pos == _head)
-		{
-		int x = 0;
-		}*/
 
 		Span* prev = pos->_prev;
 		Span* next = pos->_next;
@@ -390,6 +383,8 @@ public:
 
 private:
 	Span* _head;
+
 public:
-	std::mutex _mtx; // 桶锁
+	// 每个桶各自带一把锁，让不同 size class 之间尽量互不影响。
+	std::mutex _mtx;
 };
